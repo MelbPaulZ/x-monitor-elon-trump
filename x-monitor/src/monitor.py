@@ -223,17 +223,44 @@ def latest_status_payload(username: str, post: Optional[Dict]) -> Dict:
     post_url = post.get("url", f"https://x.com/{username}")
     text = (post.get("text", "") or "").replace("\n", " ").strip()
     text = (text[:120] + "...") if len(text) > 120 else text
+    latest = {
+        "id": post_id,
+        "time": created_str,
+        "author_handle": author_handle,
+        "is_repost": is_repost,
+        "text": text,
+        "url": post_url,
+    }
+    source_text = (post.get("source_text", "") or "").replace("\n", " ").strip()
+    if source_text or post.get("source_url") or post.get("source_author_handle"):
+        latest["source_context"] = {
+            "author_name": post.get("source_author_name", "") or "unknown",
+            "author_handle": post.get("source_author_handle", "") or "unknown",
+            "post_time": post.get("source_time", "") or "unknown",
+            "url": post.get("source_url", "") or "unknown",
+            "text": source_text or "(no text)",
+        }
+
+    is_reply = bool(post.get("is_reply", False))
+    if is_reply:
+        reply_context = {
+            "replying_to_handles": post.get("replying_to_handles", []),
+        }
+        origin_text = (post.get("reply_origin_text", "") or "").replace("\n", " ").strip()
+        if origin_text or post.get("reply_origin_url") or post.get("reply_origin_time"):
+            reply_context["origin_post"] = {
+                "author_name": post.get("reply_origin_author_name", "") or "unknown",
+                "author_handle": post.get("reply_origin_author_handle", "") or "unknown",
+                "post_time": post.get("reply_origin_time", "") or "unknown",
+                "url": post.get("reply_origin_url", "") or "unknown",
+                "text": origin_text or "(no text)",
+            }
+        latest["reply_context"] = reply_context
+
     return {
         "account": username,
         "state": "no_new_post",
-        "latest_non_pinned_post": {
-            "id": post_id,
-            "time": created_str,
-            "author_handle": author_handle,
-            "is_repost": is_repost,
-            "text": text,
-            "url": post_url,
-        },
+        "latest_non_pinned_post": latest,
     }
 
 
@@ -246,13 +273,13 @@ def latest_status_signature(payload: Dict) -> str:
     return state
 
 
-def log_status_if_changed(conn: sqlite3.Connection, payload: Dict) -> None:
+def log_status_if_changed(conn: sqlite3.Connection, payload: Dict, force_emit: bool = False) -> None:
     account = str(payload.get("account", ""))
     if not account:
         return
     signature = latest_status_signature(payload)
     previous = get_last_status_signature(conn, account)
-    if previous == signature:
+    if (not force_emit) and previous == signature:
         return
     log_json("status", **payload)
     set_last_status_signature(conn, account, signature)
@@ -264,6 +291,8 @@ def new_post_payload(username: str, post: Dict) -> Dict:
         "author_name": post.get("author_name", ""),
         "author_handle": post.get("author_handle", username),
         "is_repost": bool(post.get("is_repost", False)),
+        "is_reply": bool(post.get("is_reply", False)),
+        "replying_to_handles": post.get("replying_to_handles", []),
         "post_time": post.get("created_at", "") or "unknown time",
         "views": post.get("view_count", "unknown"),
         "likes": post.get("like_count", "unknown"),
@@ -278,7 +307,135 @@ def new_post_payload(username: str, post: Dict) -> Dict:
             "url": post.get("origin_url", payload["post_url"]),
             "text": (post.get("origin_text", "") or payload["post_text"]).replace("\n", " ").strip(),
         }
+    source_text = (post.get("source_text", "") or "").replace("\n", " ").strip()
+    if source_text or post.get("source_url") or post.get("source_author_handle"):
+        payload["source_context"] = {
+            "author_name": post.get("source_author_name", "") or "unknown",
+            "author_handle": post.get("source_author_handle", "") or "unknown",
+            "post_time": post.get("source_time", "") or "unknown",
+            "url": post.get("source_url", "") or "unknown",
+            "text": source_text or "(no text)",
+        }
+    if payload["is_reply"]:
+        reply_context = {
+            "replying_to_handles": payload["replying_to_handles"],
+        }
+        origin_author = post.get("reply_origin_author_handle", "") or "unknown"
+        origin_text = (post.get("reply_origin_text", "") or "").replace("\n", " ").strip()
+        if origin_text or post.get("reply_origin_url") or post.get("reply_origin_time"):
+            reply_context["origin_post"] = {
+                "author_name": post.get("reply_origin_author_name", "") or "unknown",
+                "author_handle": origin_author,
+                "post_time": post.get("reply_origin_time", "") or "unknown",
+                "url": post.get("reply_origin_url", "") or "unknown",
+                "text": origin_text or "(no text)",
+            }
+        payload["reply_context"] = reply_context
     return payload
+
+
+def enrich_reply_origin(post: Dict, context: BrowserContext, timeout_ms: int) -> None:
+    if not post.get("is_reply"):
+        return
+    post_url = post.get("url", "")
+    post_id = str(post.get("id", "") or "")
+    replying_to_handles = [
+        str(h).strip().lower()
+        for h in (post.get("replying_to_handles", []) or [])
+        if str(h).strip()
+    ]
+    if not post_url or not post_id:
+        return
+
+    detail_page = context.new_page()
+    try:
+        detail_page.goto(post_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        detail_page.wait_for_timeout(1500)
+        detail_page.wait_for_selector("article", timeout=timeout_ms)
+
+        origin = detail_page.evaluate(
+            """
+            ({ currentId, replyingToHandles }) => {
+              const parseHandleFromHref = (href) => {
+                const m = (href || '').match(/^\\/([^\\/?#]+)/);
+                return m ? m[1] : '';
+              };
+
+              const articles = Array.from(document.querySelectorAll('article'));
+              const parsed = [];
+
+              for (let i = 0; i < articles.length; i += 1) {
+                const article = articles[i];
+                const timeNode = article.querySelector('time');
+                const timeLink = timeNode ? timeNode.closest('a[href*="/status/"]') : null;
+                if (!timeLink) continue;
+                const href = timeLink.getAttribute('href') || '';
+                let postId = '';
+                let handle = '';
+                let m = href.match(/^\\/?([^\\/]+)\\/status\\/(\\d+)/);
+                if (m) {
+                  handle = m[1];
+                  postId = m[2];
+                } else {
+                  m = href.match(/\\/i\\/web\\/status\\/(\\d+)/);
+                  if (m) {
+                    postId = m[1];
+                  }
+                }
+                if (!postId || postId === currentId) continue;
+
+                const userNameBlock = article.querySelector('[data-testid="User-Name"]');
+                const authorAnchor = userNameBlock ? userNameBlock.querySelector('a[href^="/"]') : null;
+                const authorHref = authorAnchor ? (authorAnchor.getAttribute('href') || '') : '';
+                const authorHandle = parseHandleFromHref(authorHref) || handle || 'unknown';
+                const authorNameNode = userNameBlock ? userNameBlock.querySelector('span') : null;
+                const authorName = (authorNameNode ? authorNameNode.textContent : '').trim() || authorHandle;
+                const textNode = article.querySelector('[data-testid="tweetText"]');
+                const text = (textNode ? textNode.innerText : article.innerText || '').trim();
+                const createdAt = timeNode ? (timeNode.getAttribute('datetime') || '') : '';
+                parsed.push({
+                  idx: i,
+                  post_id: postId,
+                  author_name: authorName,
+                  author_handle: authorHandle,
+                  created_at: createdAt,
+                  url: `https://x.com/${authorHandle}/status/${postId}`,
+                  text,
+                });
+              }
+
+              if (parsed.length === 0) return null;
+              const current = parsed.find((p) => p.post_id === currentId);
+              const currentIdx = current ? current.idx : Number.MAX_SAFE_INTEGER;
+
+              const parents = parsed.filter((p) => p.post_id !== currentId && p.idx < currentIdx);
+              const preferred = parents.filter((p) =>
+                replyingToHandles.includes((p.author_handle || '').toLowerCase())
+              );
+
+              const pick = (arr) => (arr.length > 0 ? arr[arr.length - 1] : null);
+              const chosen = pick(preferred) || pick(parents) || parsed.find((p) => p.post_id !== currentId) || null;
+              if (!chosen) return null;
+
+              return {
+                author_name: chosen.author_name,
+                author_handle: chosen.author_handle,
+                created_at: chosen.created_at,
+                url: chosen.url,
+                text: chosen.text,
+              };
+            }
+            """,
+            {"currentId": post_id, "replyingToHandles": replying_to_handles},
+        )
+        if isinstance(origin, dict):
+            post["reply_origin_author_name"] = origin.get("author_name", "")
+            post["reply_origin_author_handle"] = origin.get("author_handle", "")
+            post["reply_origin_time"] = origin.get("created_at", "")
+            post["reply_origin_url"] = origin.get("url", "")
+            post["reply_origin_text"] = origin.get("text", "")
+    finally:
+        detail_page.close()
 
 
 def scrape_latest_posts(page: Page, username: str, max_posts: int, timeout_ms: int) -> List[Dict]:
@@ -322,6 +479,14 @@ def scrape_latest_posts(page: Page, username: str, max_posts: int, timeout_ms: i
             const socialContextText = (socialContextEl ? socialContextEl.innerText : '').trim();
             const isPinned = /pinned/i.test(socialContextText);
             const isRepost = /reposted/i.test(socialContextText);
+            const articleText = (article.innerText || '').trim();
+            const replyLine = (articleText.match(/Replying to ([^\\n]+)/i) || [])[1] || '';
+            const replyingToHandles = Array.from(
+              new Set(
+                Array.from(replyLine.matchAll(/@([A-Za-z0-9_]{1,15})/g)).map((m) => m[1].toLowerCase())
+              )
+            );
+            const isReply = replyingToHandles.length > 0;
             if (isPinned) continue;
 
             const userNameBlock = article.querySelector('[data-testid="User-Name"]');
@@ -337,6 +502,11 @@ def scrape_latest_posts(page: Page, username: str, max_posts: int, timeout_ms: i
             let iWebPostId = null;
             let ownCandidate = null;
             let externalCandidate = null;
+            let sourceAuthorName = '';
+            let sourceAuthorHandle = '';
+            let sourceText = '';
+            let sourceTime = '';
+            let sourceUrl = '';
 
             const timeNode = article.querySelector('time');
             const timeLink = timeNode ? timeNode.closest('a[href*="/status/"]') : null;
@@ -378,7 +548,8 @@ def scrape_latest_posts(page: Page, username: str, max_posts: int, timeout_ms: i
             if (!postId || seen.has(postId)) continue;
             seen.add(postId);
 
-            const textNode = article.querySelector('[data-testid="tweetText"]');
+            const textNodes = Array.from(article.querySelectorAll('[data-testid="tweetText"]'));
+            const textNode = textNodes.length > 0 ? textNodes[0] : null;
             const text = (textNode ? textNode.innerText : article.innerText || '').trim();
             const createdAt = timeNode ? (timeNode.getAttribute('datetime') || '') : '';
             const likeEl = article.querySelector('[data-testid="like"],[data-testid="unlike"]');
@@ -393,20 +564,53 @@ def scrape_latest_posts(page: Page, username: str, max_posts: int, timeout_ms: i
             const originHandle = isRepost ? (externalCandidate ? externalCandidate.handle : authorHandle) : '';
             const originUrl = isRepost && postId ? `https://x.com/${handle}/status/${postId}` : '';
 
+            // For quote/source posts: keep source post metadata (non-repost with external status link).
+            if (!isRepost && ownCandidate && externalCandidate) {
+              sourceAuthorHandle = externalCandidate.handle || '';
+              sourceUrl = `https://x.com/${externalCandidate.handle}/status/${externalCandidate.id}`;
+
+              const allUserNameBlocks = Array.from(article.querySelectorAll('[data-testid="User-Name"]'));
+              if (allUserNameBlocks.length > 1) {
+                const srcBlock = allUserNameBlocks[1];
+                const srcAnchor = srcBlock ? srcBlock.querySelector('a[href^="/"]') : null;
+                const srcHref = srcAnchor ? (srcAnchor.getAttribute('href') || '') : '';
+                const parsedSrcHandle = parseHandleFromHref(srcHref);
+                if (parsedSrcHandle) sourceAuthorHandle = parsedSrcHandle;
+                const srcNameNode = srcBlock ? srcBlock.querySelector('span') : null;
+                sourceAuthorName = (srcNameNode ? srcNameNode.textContent : '').trim();
+              }
+
+              if (textNodes.length > 1) {
+                sourceText = (textNodes[textNodes.length - 1].innerText || '').trim();
+              }
+
+              const timeNodes = Array.from(article.querySelectorAll('time'));
+              if (timeNodes.length > 1) {
+                sourceTime = timeNodes[timeNodes.length - 1].getAttribute('datetime') || '';
+              }
+            }
+
             out.push({
-              id: postId,
-              text,
-              created_at: createdAt,
-              url: `https://x.com/${handle}/status/${postId}`,
+                id: postId,
+                text,
+                created_at: createdAt,
+                url: `https://x.com/${handle}/status/${postId}`,
               author_name: authorName,
               author_handle: authorHandle,
               is_repost: isRepost,
               origin_author_name: isRepost ? authorName : '',
               origin_author_handle: originHandle,
-              origin_url: originUrl,
-              origin_text: isRepost ? text : '',
-              like_count: likeCount,
-              view_count: viewCount,
+                origin_url: originUrl,
+                origin_text: isRepost ? text : '',
+                is_reply: isReply,
+                replying_to_handles: replyingToHandles,
+                source_author_name: sourceAuthorName,
+                source_author_handle: sourceAuthorHandle,
+                source_time: sourceTime,
+                source_url: sourceUrl,
+                source_text: sourceText,
+                like_count: likeCount,
+                view_count: viewCount,
             });
 
             if (out.length >= maxPosts) break;
@@ -473,6 +677,7 @@ def monitor_loop(config: AppConfig) -> None:
     conn = db_connect(config.db_path)
 
     seeded_users = set()
+    startup_status_emitted = set()
 
     with sync_playwright() as p:
         context, browser = create_context(config, p)
@@ -496,13 +701,21 @@ def monitor_loop(config: AppConfig) -> None:
                             bootstrap_seen(conn, username, posts)
                             seeded_users.add(username)
                             latest_post = posts[0] if posts else None
-                            log_status_if_changed(conn, latest_status_payload(username, latest_post))
+                            force_emit = username not in startup_status_emitted
+                            log_status_if_changed(
+                                conn,
+                                latest_status_payload(username, latest_post),
+                                force_emit=force_emit,
+                            )
+                            startup_status_emitted.add(username)
                             continue
 
                         new_posts = [p for p in reversed(posts) if p.get("id") and not was_seen(conn, p["id"])]
 
                         if new_posts:
                             for post in new_posts:
+                                if post.get("is_reply"):
+                                    enrich_reply_origin(post, context, config.page_timeout_ms)
                                 msg = format_message(username, post)
                                 notify(config, msg, new_post_payload(username, post))
                                 mark_seen(conn, post["id"], username, post.get("created_at", ""))
@@ -510,7 +723,13 @@ def monitor_loop(config: AppConfig) -> None:
                                 set_last_status_signature(conn, username, f"no_new_post:{posts[0]['id']}")
                         else:
                             latest_post = posts[0] if posts else None
-                            log_status_if_changed(conn, latest_status_payload(username, latest_post))
+                            force_emit = username not in startup_status_emitted
+                            log_status_if_changed(
+                                conn,
+                                latest_status_payload(username, latest_post),
+                                force_emit=force_emit,
+                            )
+                            startup_status_emitted.add(username)
                     except Exception as e:
                         log_json("error", account=username, message=str(e))
                     finally:
